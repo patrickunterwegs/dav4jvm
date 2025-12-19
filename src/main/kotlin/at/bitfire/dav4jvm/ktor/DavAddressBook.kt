@@ -14,34 +14,26 @@ import at.bitfire.dav4jvm.Property
 import at.bitfire.dav4jvm.XmlUtils
 import at.bitfire.dav4jvm.XmlUtils.insertTag
 import at.bitfire.dav4jvm.property.carddav.AddressData
-import at.bitfire.dav4jvm.property.carddav.NS_CARDDAV
-import at.bitfire.dav4jvm.property.common.HrefListProperty
-import at.bitfire.dav4jvm.property.webdav.GetContentType
-import at.bitfire.dav4jvm.property.webdav.GetETag
-import at.bitfire.dav4jvm.property.webdav.NS_WEBDAV
-import io.ktor.client.*
-import io.ktor.client.request.*
-import io.ktor.http.*
-import io.ktor.util.logging.*
+import at.bitfire.dav4jvm.property.carddav.CardDAV
+import at.bitfire.dav4jvm.property.webdav.WebDAV
+import io.ktor.client.HttpClient
+import io.ktor.client.request.header
+import io.ktor.client.request.prepareRequest
+import io.ktor.client.request.setBody
+import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
+import io.ktor.http.Url
+import io.ktor.http.contentType
+import io.ktor.util.logging.Logger
 import org.slf4j.LoggerFactory
 import java.io.StringWriter
 
-@Suppress("unused")
-class DavAddressBook @JvmOverloads constructor(
+class DavAddressBook(
     httpClient: HttpClient,
     location: Url,
     logger: Logger = LoggerFactory.getLogger(DavAddressBook::javaClass.name)
 ): DavCollection(httpClient, location, logger) {
-
-    companion object {
-        val MIME_JCARD = ContentType.Companion.parse("application/vcard+json")
-        val MIME_VCARD3_UTF8 = ContentType.Companion.parse("text/vcard;charset=utf-8")
-        val MIME_VCARD4 = ContentType.Companion.parse("text/vcard;version=4.0")
-
-        val ADDRESSBOOK_QUERY = Property.Name(NS_CARDDAV, "addressbook-query")
-        val ADDRESSBOOK_MULTIGET = Property.Name(NS_CARDDAV, "addressbook-multiget")
-        val FILTER = Property.Name(NS_CARDDAV, "filter")
-    }
 
     /**
      * Sends an addressbook-query REPORT request to the resource.
@@ -65,27 +57,30 @@ class DavAddressBook @JvmOverloads constructor(
         val writer = StringWriter()
         serializer.setOutput(writer)
         serializer.startDocument("UTF-8", null)
-        serializer.setPrefix("", NS_WEBDAV)
-        serializer.setPrefix("CARD", NS_CARDDAV)
-        serializer.insertTag(ADDRESSBOOK_QUERY) {
-            insertTag(PROP) {
-                insertTag(GetETag.Companion.NAME)
+        serializer.setPrefix("", WebDAV.NS_WEBDAV)
+        serializer.setPrefix("CARD", CardDAV.NS_CARDDAV)
+        serializer.insertTag(CardDAV.AddressbookQuery) {
+            insertTag(WebDAV.Prop) {
+                insertTag(WebDAV.GetETag)
             }
-            insertTag(FILTER)
+            insertTag(CardDAV.Filter)
         }
         serializer.endDocument()
 
-        followRedirects {
-            httpClient.prepareRequest {
-                url(location)
-                method = HttpMethod.Companion.parse("REPORT")
-                headers.append(HttpHeaders.ContentType, MIME_XML.toString())
+        var result: List<Property>? = null
+        followRedirects({
+            httpClient.prepareRequest(location) {
+                method = HttpMethod.parse("REPORT")
+
+                header(HttpHeaders.Depth, "1")
+
+                contentType(MIME_XML_UTF8)
                 setBody(writer.toString())
-                headers.append(HttpHeaders.Depth, "1")
-            }.execute()
-        }.let { response ->
-            return processMultiStatus(response, callback)
+            }
+        }) { response ->
+            result = processMultiStatus(response, callback)
         }
+        return result ?: emptyList()
     }
 
     /**
@@ -105,7 +100,12 @@ class DavAddressBook @JvmOverloads constructor(
      * @throws at.bitfire.dav4jvm.ktor.exception.HttpException on HTTP error
      * @throws at.bitfire.dav4jvm.ktor.exception.DavException on WebDAV error
      */
-    suspend fun multiget(urls: List<Url>, contentType: String? = null, version: String? = null, callback: MultiResponseCallback): List<Property> {
+    suspend fun multiget(
+        urls: List<Url>,
+        contentType: String? = null,
+        version: String? = null,
+        callback: MultiResponseCallback
+    ): List<Property> {
         /* <!ELEMENT addressbook-multiget ((DAV:allprop |
                                             DAV:propname |
                                             DAV:prop)?,
@@ -115,37 +115,49 @@ class DavAddressBook @JvmOverloads constructor(
         val writer = StringWriter()
         serializer.setOutput(writer)
         serializer.startDocument("UTF-8", null)
-        serializer.setPrefix("", NS_WEBDAV)
-        serializer.setPrefix("CARD", NS_CARDDAV)
-        serializer.insertTag(ADDRESSBOOK_MULTIGET) {
-            insertTag(PROP) {
-                insertTag(GetContentType.Companion.NAME)
-                insertTag(GetETag.Companion.NAME)
-                insertTag(AddressData.Companion.NAME) {
+        serializer.setPrefix("", WebDAV.NS_WEBDAV)
+        serializer.setPrefix("CARD", CardDAV.NS_CARDDAV)
+        serializer.insertTag(CardDAV.AddressbookMultiget) {
+            insertTag(WebDAV.Prop) {
+                insertTag(WebDAV.GetContentType)
+                insertTag(WebDAV.GetETag)
+                insertTag(CardDAV.AddressData) {
                     if (contentType != null)
-                        attribute(null, AddressData.Companion.CONTENT_TYPE, contentType)
+                        attribute(null, AddressData.CONTENT_TYPE, contentType)
                     if (version != null)
-                        attribute(null, AddressData.Companion.VERSION, version)
+                        attribute(null, AddressData.VERSION, version)
                 }
             }
             for (url in urls)
-                insertTag(HrefListProperty.HREF) {
+                insertTag(WebDAV.Href) {
                     text(url.encodedPath)
                 }
         }
         serializer.endDocument()
 
-        followRedirects {
-            httpClient.prepareRequest {
-                url(location)
-                method = HttpMethod.Companion.parse("REPORT")
+        var result: List<Property>? = null
+        followRedirects({
+            httpClient.prepareRequest(location) {
+                method = HttpMethod.parse("REPORT")
+
+                header(HttpHeaders.Depth, "0")
+
+                contentType(MIME_XML_UTF8)
                 setBody(writer.toString())
-                headers.append(HttpHeaders.ContentType, MIME_XML.toString())
-                headers.append(HttpHeaders.Depth, "0")
-            }.execute()
-        }.let { response ->
-            return processMultiStatus(response, callback)
+            }
+        }) { response ->
+            result = processMultiStatus(response, callback)
         }
+        return result ?: emptyList()
+    }
+
+
+    companion object {
+
+        val MIME_JCARD = ContentType.parse("application/vcard+json")
+        val MIME_VCARD3_UTF8 = ContentType.parse("text/vcard;charset=utf-8")
+        val MIME_VCARD4 = ContentType.parse("text/vcard;version=4.0")
+
     }
 
 }

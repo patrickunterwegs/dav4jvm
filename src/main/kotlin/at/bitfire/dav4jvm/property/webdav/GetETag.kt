@@ -30,14 +30,12 @@ data class GetETag(
 ): Property {
 
     companion object {
-        @JvmField
-        val NAME = Property.Name(NS_WEBDAV, "getetag")
 
         fun fromHttpResponse(response: HttpResponse) =
             response.headers[HttpHeaders.ETag]?.let { GetETag(it) }
 
         fun fromResponse(response: Response) =
-            response.header("ETag")?.let { GetETag(it) }
+            response.header(HttpHeaders.ETag)?.let { GetETag(it) }
     }
 
     /**
@@ -87,7 +85,7 @@ data class GetETag(
 
     object Factory: PropertyFactory {
 
-        override fun getName() = NAME
+        override fun getName() = WebDAV.GetETag
 
         override fun create(parser: XmlPullParser): GetETag =
             GetETag(XmlReader(parser).readText())

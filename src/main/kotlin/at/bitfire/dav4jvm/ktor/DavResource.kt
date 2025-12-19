@@ -11,59 +11,54 @@
 package at.bitfire.dav4jvm.ktor
 
 import at.bitfire.dav4jvm.Property
-import at.bitfire.dav4jvm.QuotedStringUtils
-import at.bitfire.dav4jvm.XmlReader
 import at.bitfire.dav4jvm.XmlUtils
 import at.bitfire.dav4jvm.XmlUtils.insertTag
 import at.bitfire.dav4jvm.XmlUtils.propertyName
 import at.bitfire.dav4jvm.ktor.DavResource.Companion.MAX_REDIRECTS
-import at.bitfire.dav4jvm.ktor.Response.Companion.MULTISTATUS
-import at.bitfire.dav4jvm.ktor.Response.Companion.RESPONSE
-import at.bitfire.dav4jvm.ktor.exception.ConflictException
 import at.bitfire.dav4jvm.ktor.exception.DavException
-import at.bitfire.dav4jvm.ktor.exception.ForbiddenException
-import at.bitfire.dav4jvm.ktor.exception.GoneException
 import at.bitfire.dav4jvm.ktor.exception.HttpException
-import at.bitfire.dav4jvm.ktor.exception.NotFoundException
-import at.bitfire.dav4jvm.ktor.exception.PreconditionFailedException
-import at.bitfire.dav4jvm.ktor.exception.ServiceUnavailableException
-import at.bitfire.dav4jvm.ktor.exception.UnauthorizedException
-import at.bitfire.dav4jvm.property.caldav.NS_CALDAV
-import at.bitfire.dav4jvm.property.carddav.NS_CARDDAV
-import at.bitfire.dav4jvm.property.webdav.NS_WEBDAV
+import at.bitfire.dav4jvm.property.caldav.CalDAV
+import at.bitfire.dav4jvm.property.carddav.CardDAV
 import at.bitfire.dav4jvm.property.webdav.SyncToken
+import at.bitfire.dav4jvm.property.webdav.WebDAV
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.compression.compress
 import io.ktor.client.request.header
+import io.ktor.client.request.prepareDelete
+import io.ktor.client.request.prepareGet
+import io.ktor.client.request.prepareHead
+import io.ktor.client.request.prepareOptions
+import io.ktor.client.request.preparePost
+import io.ktor.client.request.preparePut
 import io.ktor.client.request.prepareRequest
 import io.ktor.client.request.setBody
-import io.ktor.client.request.url
 import io.ktor.client.statement.HttpResponse
-import io.ktor.client.statement.bodyAsBytes
+import io.ktor.client.statement.HttpStatement
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.ContentType
 import io.ktor.http.Headers
-import io.ktor.http.HeadersBuilder
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.URLBuilder
+import io.ktor.http.URLParserException
 import io.ktor.http.Url
-import io.ktor.http.append
 import io.ktor.http.contentType
 import io.ktor.http.isSecure
 import io.ktor.http.isSuccess
 import io.ktor.http.takeFrom
 import io.ktor.http.withCharset
-import io.ktor.util.appendAll
+import io.ktor.util.IdentityEncoder
 import io.ktor.util.logging.Logger
-import io.ktor.utils.io.core.readFully
-import io.ktor.utils.io.readBuffer
+import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.jvm.javaio.toInputStream
+import io.ktor.utils.io.peek
+import kotlinx.io.bytestring.encodeToByteString
 import org.slf4j.LoggerFactory
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserException
 import java.io.EOFException
 import java.io.IOException
-import java.io.Reader
 import java.io.StringWriter
 
 
@@ -84,7 +79,7 @@ import java.io.StringWriter
  * @param location      location of the WebDAV resource
  * @param logger        will be used for logging
  */
-open class DavResource @JvmOverloads constructor(
+open class DavResource(
     val httpClient: HttpClient,
     location: Url,
     val logger: Logger = LoggerFactory.getLogger(DavResource::class.java.name)
@@ -93,15 +88,9 @@ open class DavResource @JvmOverloads constructor(
     companion object {
         const val MAX_REDIRECTS = 5
 
-        val MIME_XML = ContentType.Application.Xml.withCharset(Charsets.UTF_8)
+        val MIME_XML_UTF8 = ContentType.Application.Xml.withCharset(Charsets.UTF_8)
 
-        val PROPFIND = Property.Name(NS_WEBDAV, "propfind")
-        val PROPERTYUPDATE = Property.Name(NS_WEBDAV, "propertyupdate")
-        val SET = Property.Name(NS_WEBDAV, "set")
-        val REMOVE = Property.Name(NS_WEBDAV, "remove")
-        val PROP = Property.Name(NS_WEBDAV, "prop")
-
-        val XML_SIGNATURE = "<?xml".toByteArray()
+        val XML_SIGNATURE = "<?xml".encodeToByteString()
 
 
         /**
@@ -115,14 +104,14 @@ open class DavResource @JvmOverloads constructor(
             val serializer = XmlUtils.newSerializer()
             val writer = StringWriter()
             serializer.setOutput(writer)
-            serializer.setPrefix("d", NS_WEBDAV)
+            serializer.setPrefix("d", WebDAV.NS_WEBDAV)
             serializer.startDocument("UTF-8", null)
-            serializer.insertTag(PROPERTYUPDATE) {
+            serializer.insertTag(WebDAV.PropertyUpdate) {
                 // DAV:set
                 if (setProperties.isNotEmpty()) {
-                    serializer.insertTag(SET) {
+                    serializer.insertTag(WebDAV.Set) {
                         for (prop in setProperties) {
-                            serializer.insertTag(PROP) {
+                            serializer.insertTag(WebDAV.Prop) {
                                 serializer.insertTag(prop.key) {
                                     text(prop.value)
                                 }
@@ -133,9 +122,9 @@ open class DavResource @JvmOverloads constructor(
 
                 // DAV:remove
                 if (removeProperties.isNotEmpty()) {
-                    serializer.insertTag(REMOVE) {
+                    serializer.insertTag(WebDAV.Remove) {
                         for (prop in removeProperties) {
-                            insertTag(PROP) {
+                            insertTag(WebDAV.Prop) {
                                 insertTag(prop)
                             }
                         }
@@ -152,52 +141,61 @@ open class DavResource @JvmOverloads constructor(
     /**
      * URL of this resource (changes when being redirected by server)
      */
-    var location: Url
+    var location: Url = location
         private set             // allow internal modification only (for redirects)
-
-    init {
-        this.location = location
-    }
-
-    override fun toString() = location.toString()
 
 
     /**
-     * Gets the file name of this resource. See [KtorHttpUtils.fileName] for details.
+     * File name of this resource (determined from [location])
      */
-    fun fileName() = KtorHttpUtils.fileName(location)
+    val fileName
+        get() = KtorHttpUtils.fileName(location)
 
 
     /**
      * Sends an OPTIONS request to this resource without HTTP compression (because some servers have
      * broken compression for OPTIONS). Follows up to [MAX_REDIRECTS] redirects when set.
      *
-     * @param followRedirects whether redirects should be followed (default: *false*)
-     * @param callback called with server response unless an exception is thrown
+     * @param followRedirects   whether redirects should be followed (default: *false*)
+     * @param callback          called with server response on success
      *
      * @throws IOException on I/O error
      * @throws HttpException on HTTP error
      * @throws DavException on HTTPS -> HTTP redirect
      */
-    @Throws(IOException::class, HttpException::class)
     suspend fun options(followRedirects: Boolean = false, callback: CapabilitiesCallback) {
-        val request = httpClient.prepareRequest {
-            url(location)
-            method = HttpMethod.Options
-            headers.append(HttpHeaders.ContentLength, "0")
-            headers.append(HttpHeaders.AcceptEncoding, "identity")
+        if (followRedirects)
+            followRedirects(
+                prepareRequest = ::prepareOptionsRequest,
+                callback = { response ->
+                    processOptionsResponse(response, callback)
+                }
+            )
+        else {
+            prepareOptionsRequest().execute { response ->
+                processOptionsResponse(response, callback)
+            }
         }
-        val response = if (followRedirects)
-            followRedirects { request.execute() }
-        else
-            request.execute()
+    }
 
+    private suspend fun prepareOptionsRequest(): HttpStatement =
+        httpClient.prepareOptions(location) {
+            // explicitly set Content-Length although OPTIONS has no request body (for compatibility)
+            header(HttpHeaders.ContentLength, "0")
+
+            // explicitly disable compression (for compatibility)
+            compress(IdentityEncoder.name)
+        }
+
+    private suspend fun processOptionsResponse(response: HttpResponse, callback: CapabilitiesCallback) {
+        // check for success
         checkStatus(response)
+
+        val capabilities = KtorHttpUtils.listHeader(response, "DAV")
         callback.onCapabilities(
-            KtorHttpUtils.listHeader(response, "DAV").map { it.trim() }.toSet(),
+            capabilities.map { it.trim() }.toSet(),
             response
         )
-
     }
 
     /**
@@ -211,25 +209,25 @@ open class DavResource @JvmOverloads constructor(
      * @throws HttpException on HTTP error
      * @throws DavException on WebDAV error or HTTPS -> HTTP redirect
      */
-    @Throws(IOException::class, HttpException::class, DavException::class)
     suspend fun move(destination: Url, overwrite: Boolean, callback: ResponseCallback) {
-
-        followRedirects {
-            httpClient.prepareRequest {
-                url(location)
+        followRedirects({
+            httpClient.prepareRequest(location) {
                 method = HttpMethod.parse("MOVE")
-                headers.append(HttpHeaders.ContentLength, "0")
-                headers.append(HttpHeaders.Destination, destination.toString())
+
+                header(HttpHeaders.ContentLength, "0")
+                header(HttpHeaders.Destination, destination.toString())
                 if (!overwrite)      // RFC 4918 9.9.3 and 10.6, default value: T
-                    headers.append(HttpHeaders.Overwrite, "F")
-            }.execute()
-        }.let { response ->
+                    header(HttpHeaders.Overwrite, "F")
+            }
+        }) { response ->
             checkStatus(response)
-            if (response.status == HttpStatusCode.MultiStatus)
-            /* Multiple resources were to be affected by the MOVE, but errors on some
-            of them prevented the operation from taking place.
-            [_] (RFC 4918 9.9.4. Status Codes for MOVE Method) */
-                throw HttpException(response)
+
+            if (response.status == HttpStatusCode.MultiStatus) {
+                /* Multiple resources were to be affected by the MOVE, but errors on some
+                of them prevented the operation from taking place.
+                [_] (RFC 4918 9.9.4. Status Codes for MOVE Method) */
+                throw HttpException.fromResponse(response)
+            }
 
             // update location
             val nPath = response.headers[HttpHeaders.Location] ?: destination.toString()
@@ -249,25 +247,24 @@ open class DavResource @JvmOverloads constructor(
      * @throws HttpException on HTTP error
      * @throws DavException on WebDAV error or HTTPS -> HTTP redirect
      */
-    @Throws(IOException::class, HttpException::class, DavException::class)
     suspend fun copy(destination: Url, overwrite: Boolean, callback: ResponseCallback) {
-
-        followRedirects {
-            httpClient.prepareRequest {
-                url(location)
+        followRedirects({
+            httpClient.prepareRequest(location) {
                 method = HttpMethod.parse("COPY")
-                headers.append(HttpHeaders.ContentLength, "0")
-                headers.append(HttpHeaders.Destination, destination.toString())
+
+                header(HttpHeaders.ContentLength, "0")
+                header(HttpHeaders.Destination, destination.toString())
                 if (!overwrite)      // RFC 4918 9.9.3 and 10.6, default value: T
-                    headers.append("Overwrite", "F")
-            }.execute()
-        }.let { response ->
+                    header("Overwrite", "F")
+            }
+        }) { response ->
             checkStatus(response)
-            if(response.status == HttpStatusCode.MultiStatus)
-            /* Multiple resources were to be affected by the COPY, but errors on some
-            of them prevented the operation from taking place.
-            [_] (RFC 4918 9.8.5. Status Codes for COPY Method) */
-                throw HttpException(response)
+
+            if (response.status == HttpStatusCode.MultiStatus)
+                /* Multiple resources were to be affected by the COPY, but errors on some
+                of them prevented the operation from taking place.
+                [_] (RFC 4918 9.8.5. Status Codes for COPY Method) */
+                throw HttpException.fromResponse(response)
 
             callback.onResponse(response)
         }
@@ -278,28 +275,32 @@ open class DavResource @JvmOverloads constructor(
      * Because the target [location] is by definition a collection, a trailing slash
      * is appended (unless [location] already has a trailing slash).
      *
-     * @param xmlBody optional request body (used for MKCALENDAR or Extended MKCOL)
-     * @param method HTTP MKCOL method (`MKCOL` by default, may for instance be `MKCALENDAR`)
-     * @param headersOptional additional headers to send with the request
-     * @param callback called for the response
+     * @param xmlBody           optional request body (used for MKCALENDAR or Extended MKCOL)
+     * @param methodName        HTTP MKCOL method (`MKCOL` by default, may for instance be `MKCALENDAR`)
+     * @param additionalHeaders additional headers to send with the request
+     * @param callback          called with server response on success
      *
      * @throws IOException on I/O error
      * @throws HttpException on HTTP error
      * @throws DavException on HTTPS -> HTTP redirect
      */
-    @Throws(IOException::class, HttpException::class)
-    suspend fun mkCol(xmlBody: String?, method: String = "MKCOL", headersOptional: Headers? = null, callback: ResponseCallback) {
+    suspend fun mkCol(
+        xmlBody: String?,
+        methodName: String = "MKCOL",
+        additionalHeaders: Headers? = null,
+        callback: ResponseCallback
+    ) {
+        followRedirects({
+            httpClient.prepareRequest(UrlUtils.withTrailingSlash(location)) {
+                method = HttpMethod.parse(methodName)
 
-        followRedirects {
-            httpClient.prepareRequest {
-                this.method = HttpMethod.parse(method)
+                if (additionalHeaders != null)
+                    headers.appendAll(additionalHeaders)
+
+                contentType(MIME_XML_UTF8)
                 setBody(xmlBody)
-                headers.append(HttpHeaders.ContentType, MIME_XML)
-                url(UrlUtils.withTrailingSlash(location))
-                if (headersOptional != null)
-                    headers.appendAll(headersOptional)
-            }.execute()
-        }.let { response ->
+            }
+        }) { response ->
             checkStatus(response)
             callback.onResponse(response)
         }
@@ -310,251 +311,176 @@ open class DavResource @JvmOverloads constructor(
      *
      * Follows up to [MAX_REDIRECTS] redirects.
      *
-     * @param callback called with server response unless an exception is thrown
+     * @param callback              called with server response on success
      *
      * @throws IOException on I/O error
      * @throws HttpException on HTTP error
      * @throws DavException on HTTPS -> HTTP redirect
      */
     suspend fun head(callback: ResponseCallback) {
-
-        followRedirects {
-            httpClient.prepareRequest {
-                method = HttpMethod.Head
-                url(location)
-            }.execute()
-        }.let { response ->
-            checkStatus(response)
-            callback.onResponse(response)
-        }
-
-        /*  TODO @ricki, second call omitted, not sure if this was done like that on purpose?
-        followRedirects {
-            httpClient.newCall(
-                Request.Builder()
-                    .head()
-                    .url(location)
-                    .build()
-            ).execute()
-        }.use { response ->
-            checkStatus(response)
-            callback.onResponse(response)
-        }
-         */
-    }
-
-    /**
-     * Sends a GET request to the resource. Follows up to [MAX_REDIRECTS] redirects.
-     *
-     * Note: Add `Accept-Encoding: identity` to [headers] if you want to disable compression
-     * (compression might change the returned ETag).
-     *
-     * @param accept   value of `Accept` header (always sent for clarity; use *&#47;* if you don't care)
-     * @param headers  additional headers to send with the request
-     *
-     * @return HttpResponse
-     *
-     * @throws IOException on I/O error
-     * @throws HttpException on HTTP error
-     * @throws DavException on HTTPS -> HTTP redirect
-     */
-    suspend fun get(accept: String, headers: Headers?): HttpResponse =
-        followRedirects {
-            httpClient.prepareRequest {
-                method = HttpMethod.Get
-                url(location)
-                if (headers != null)
-                    this.headers.appendAll(headers)
-                header(HttpHeaders.Accept, accept)
-            }.execute()
-        }
-
-
-    /**
-     * Sends a GET request to the resource. Sends `Accept-Encoding: identity` to disable
-     * compression, because compression might change the ETag.
-     *
-     * Follows up to [MAX_REDIRECTS] redirects.
-     *
-     * @param accept   value of `Accept` header (always sent for clarity; use *&#47;* if you don't care)
-     * @param callback called with server response unless an exception is thrown
-     *
-     * @throws IOException on I/O error
-     * @throws HttpException on HTTP error
-     * @throws DavException on HTTPS -> HTTP redirect
-     */
-    @Deprecated("Use get(accept, headers, callback) with explicit Accept-Encoding instead")
-    @Throws(IOException::class, HttpException::class)
-    suspend fun get(accept: String, callback: ResponseCallback) =
-        get(accept, Headers.build { append(HttpHeaders.AcceptEncoding, "identity") }, callback)
-
-    /**
-     * Sends a GET request to the resource. Follows up to [MAX_REDIRECTS] redirects.
-     *
-     * Note: Add `Accept-Encoding: identity` to [headers] if you want to disable compression
-     * (compression might change the returned ETag).
-     *
-     * @param accept   value of `Accept` header (always sent for clarity; use *&#47;* if you don't care)
-     * @param headers  additional headers to send with the request
-     * @param callback called with server response unless an exception is thrown
-     *
-     * @throws IOException on I/O error
-     * @throws HttpException on HTTP error
-     * @throws DavException on HTTPS -> HTTP redirect
-     */
-    suspend fun get(accept: String, headers: Headers?, callback: ResponseCallback) {
-        get(accept, headers).let { response ->
+        followRedirects({
+            httpClient.prepareHead(location)
+        }) { response ->
             checkStatus(response)
             callback.onResponse(response)
         }
     }
 
     /**
-     * Sends a GET request to the resource for a specific byte range. Make sure to check the
-     * response code: servers may return the whole resource with 200 or partials with 206.
+     * Sends a GET request to the resource.
      *
      * Follows up to [MAX_REDIRECTS] redirects.
      *
-     * @param accept   value of `Accept` header (always sent for clarity; use *&#47;* if you don't care)
-     * @param offset   zero-based index of first byte to request
-     * @param size     number of bytes to request
-     * @param headers  additional headers to send with the request
-     * @param callback called with server response unless an exception is thrown
+     * @param additionalHeaders     additional headers to send with the request (at least [HttpHeaders.Accept] is recommended)
+     * @param disableCompression    whether compression shall be disabled (because it may change the returned ETag)
+     * @param callback              called with server response on success
+     *
+     * @throws IOException on I/O error
+     * @throws HttpException on HTTP error
+     * @throws DavException on HTTPS -> HTTP redirect
+     */
+    suspend fun get(
+        additionalHeaders: Headers? = null,
+        disableCompression: Boolean = false,
+        callback: ResponseCallback
+    ) {
+        followRedirects({
+            httpClient.prepareGet(location) {
+                if (additionalHeaders != null)
+                    headers.appendAll(additionalHeaders)
+
+                if (disableCompression)
+                    compress(IdentityEncoder.name)
+            }
+        }) { response ->
+            checkStatus(response)
+            callback.onResponse(response)
+        }
+    }
+
+    /**
+     * Sends a ranged GET request to the resource for a specific byte range.
+     *
+     * Make sure to check the response code in the callback because servers may
+     * return partials with 206, but also the whole resource with 200.
+     *
+     * Follows up to [MAX_REDIRECTS] redirects.
+     *
+     * @param offset            zero-based index of first byte to request
+     * @param size              number of bytes to request
+     * @param additionalHeaders additional headers to send with the request (at least [HttpHeaders.Accept] is recommended)
+     * @param callback          called with server response on success
      *
      * @throws IOException on I/O error
      * @throws HttpException on HTTP error
      * @throws DavException on high-level errors
      */
-    @Throws(IOException::class, HttpException::class)
-    suspend fun getRange(accept: String, offset: Long, size: Int, headers: Headers? = null, callback: ResponseCallback) {
-        followRedirects {
-            httpClient.prepareRequest {
-                method = HttpMethod.Get
-                url(location)
-                if (headers != null)
-                    this.headers.appendAll(headers)
+    suspend fun getRange(offset: Long, size: Int, additionalHeaders: Headers? = null, callback: ResponseCallback) {
+        followRedirects({
+            httpClient.prepareGet(location) {
                 val lastIndex = offset + size - 1
-                this.headers.append(HttpHeaders.Accept, accept)
-                this.headers.append(HttpHeaders.Range, "bytes=$offset-$lastIndex")
-            }.execute()
-        }.let { response ->
+                header(HttpHeaders.Range, "bytes=$offset-$lastIndex")
+
+                if (additionalHeaders != null)
+                    headers.appendAll(additionalHeaders)
+            }
+        }) { response ->
             checkStatus(response)
             callback.onResponse(response)
         }
     }
 
     /**
-     * Sends a GET request to the resource. Follows up to [MAX_REDIRECTS] redirects.
+     * Sends a POST request to the resource.
+     *
+     * Follows up to [MAX_REDIRECTS] redirects.
+     *
+     * @param provideBody       resource body to upload (unconsumed, may be called multiple times on redirects)
+     * @param mimeType          content type of resource body
+     * @param additionalHeaders additional headers to send
+     * @param callback          called with server response on success
      */
-    @Throws(IOException::class, HttpException::class)
-    suspend fun post(body: String, ifNoneMatch: Boolean = false, headers: Headers? = null, callback: ResponseCallback) {
+    suspend fun post(
+        provideBody: () -> ByteReadChannel,
+        mimeType: ContentType,
+        additionalHeaders: Headers? = null,
+        callback: ResponseCallback
+    ) {
+        followRedirects({
+            httpClient.preparePost(location) {
+                if (additionalHeaders != null)
+                    headers.appendAll(additionalHeaders)
 
-        followRedirects {
-            httpClient.prepareRequest {
-                method = HttpMethod.Post
-                url(location)
-                this.setBody(body)    // TODO: check in detail if this is correct, changed to String instead of HttpRequest
-                if (ifNoneMatch)
-                    this.headers.append(HttpHeaders.IfNoneMatch, "*")
-                if (headers?.isEmpty() == false)
-                    this.headers.appendAll(headers)
-            }.execute()
-        }.let { response ->
+                contentType(mimeType)
+                setBody(provideBody())
+            }
+        }) { response ->
             checkStatus(response)
             callback.onResponse(response)
         }
     }
 
     /**
-     * Sends a PUT request to the resource. Follows up to [MAX_REDIRECTS] redirects.
+     * Sends a PUT request to the resource.
      *
-     * When the server returns an ETag, it is stored in response properties.
+     * Follows up to [MAX_REDIRECTS] redirects.
      *
-     * @param body          new resource body to upload
-     * @param ifETag        value of `If-Match` header to set, or null to omit
-     * @param ifScheduleTag value of `If-Schedule-Tag-Match` header to set, or null to omit
-     * @param ifNoneMatch   indicates whether `If-None-Match: *` ("don't overwrite anything existing") header shall be sent
-     * @param headers       additional headers to send
-     * @param callback      called with server response unless an exception is thrown
+     * @param provideBody       resource body to upload (unconsumed, may be called multiple times on redirects)
+     * @param mimeType          content type of resource body
+     * @param additionalHeaders additional headers to send (like [HttpHeaders.IfNoneMatch] to prevent overwriting)
+     * @param callback          called with server response on success
      *
      * @throws IOException on I/O error
      * @throws HttpException on HTTP error
      * @throws DavException on HTTPS -> HTTP redirect
      */
-    @Throws(IOException::class, HttpException::class)
     suspend fun put(
-        body: String,      // TODO: Changed to String, maybe a problem for DAVx5? The ContentType is anyway defined in headers
-        headers: Headers = HeadersBuilder().build(),
-        ifETag: String? = null,
-        ifScheduleTag: String? = null,
-        ifNoneMatch: Boolean = false,
+        provideBody: () -> ByteReadChannel,
+        mimeType: ContentType,
+        additionalHeaders: Headers? = null,
         callback: ResponseCallback
     ) {
+        followRedirects({
+            httpClient.preparePut(location) {
+                if (additionalHeaders != null)
+                    headers.appendAll(additionalHeaders)
 
-        followRedirects {
-            httpClient.prepareRequest {
-                method = HttpMethod.Put
-                //header(HttpHeaders.ContentType, contentType)
-                setBody(body)
-                url(location)
-                if (ifETag != null)
-                // only overwrite specific version
-                    header(HttpHeaders.IfMatch, QuotedStringUtils.asQuotedString(ifETag))
-                if (ifScheduleTag != null)
-                // only overwrite specific version
-                    header(HttpHeaders.IfScheduleTagMatch, QuotedStringUtils.asQuotedString(ifScheduleTag))
-                if (ifNoneMatch)
-                // don't overwrite anything existing
-                    header(HttpHeaders.IfNoneMatch, "*")
-                // TODO: Check with  Ricki: Is it okay to use just header here? Or should we use append?
-            }.execute()
-        }.let { response ->
+                contentType(mimeType)
+                setBody(provideBody())
+            }
+        }) { response ->
             checkStatus(response)
             callback.onResponse(response)
         }
     }
 
     /**
-     * Sends a DELETE request to the resource. Warning: Sending this request to a collection will
-     * delete the collection with all its contents!
+     * Sends a DELETE request to the resource.
      *
      * Follows up to [MAX_REDIRECTS] redirects.
      *
-     * @param ifETag        value of `If-Match` header to set, or null to omit
-     * @param ifScheduleTag value of `If-Schedule-Tag-Match` header to set, or null to omit
-     * @param headers       additional headers to send
-     * @param callback      called with server response unless an exception is thrown
+     * @param additionalHeaders additional headers to send
+     * @param callback          called with server response on success
      *
-     * @throws IOException on I/O error
-     * @throws HttpException on HTTP errors, or when 207 Multi-Status is returned
-     *         (because then there was probably a problem with a member resource)
-     * @throws DavException on HTTPS -> HTTP redirect
+     * @throws IOException      on I/O error
+     * @throws HttpException    on HTTP errors, or when 207 Multi-Status is returned
+     *                          (because then there was probably a problem with a member resource)
+     * @throws DavException     on HTTPS -> HTTP redirect
      */
-    @Throws(IOException::class, HttpException::class)
-    suspend fun delete(
-        ifETag: String? = null,
-        ifScheduleTag: String? = null,
-        headers: Map<String, String> = emptyMap(),
-        callback: ResponseCallback
-    ) {
-        followRedirects {
-            httpClient.prepareRequest {
-                method = HttpMethod.Delete
-                url(location)
-                if (ifETag != null)
-                    header(HttpHeaders.IfMatch, QuotedStringUtils.asQuotedString(ifETag))
-                if (ifScheduleTag != null)
-                    header(HttpHeaders.IfScheduleTagMatch, QuotedStringUtils.asQuotedString(ifScheduleTag))
-                this.headers.appendAll(headers)   // TODO: check with Ricki if the previous two headers also shouldn't be appended!
-            }.execute()
-        }.let { response ->
+    suspend fun delete(additionalHeaders: Headers? = null, callback: ResponseCallback) {
+        followRedirects({
+            httpClient.prepareDelete(location) {
+                if (additionalHeaders != null)
+                    headers.appendAll(additionalHeaders)
+            }
+        }) { response ->
             checkStatus(response)
 
             if (response.status == HttpStatusCode.MultiStatus)
-            /* If an error occurs deleting a member resource (a resource other than
-               the resource identified in the Request-URI), then the response can be
-               a 207 (Multi-Status). […] (RFC 4918 9.6.1. DELETE for Collections) */
-                throw HttpException(response)
+                /* If an error occurs deleting a member resource (a resource other than
+                   the resource identified in the Request-URI), then the response can be
+                   a 207 (Multi-Status). […] (RFC 4918 9.6.1. DELETE for Collections) */
+                throw HttpException.fromResponse(response)
 
             callback.onResponse(response)
         }
@@ -573,33 +499,33 @@ open class DavResource @JvmOverloads constructor(
      * @throws HttpException on HTTP error
      * @throws DavException on WebDAV error (like no 207 Multi-Status response) or HTTPS -> HTTP redirect
      */
-    @Throws(IOException::class, HttpException::class, DavException::class)
     suspend fun propfind(depth: Int, vararg reqProp: Property.Name, callback: MultiResponseCallback) {
         // build XML request body
         val serializer = XmlUtils.newSerializer()
         val writer = StringWriter()
         serializer.setOutput(writer)
-        serializer.setPrefix("", NS_WEBDAV)
-        serializer.setPrefix("CAL", NS_CALDAV)
-        serializer.setPrefix("CARD", NS_CARDDAV)
+        serializer.setPrefix("", WebDAV.NS_WEBDAV)
+        serializer.setPrefix("CAL", CalDAV.NS_CALDAV)
+        serializer.setPrefix("CARD", CardDAV.NS_CARDDAV)
         serializer.startDocument("UTF-8", null)
-        serializer.insertTag(PROPFIND) {
-            insertTag(PROP) {
+        serializer.insertTag(WebDAV.PropFind) {
+            insertTag(WebDAV.Prop) {
                 for (prop in reqProp)
                     insertTag(prop)
             }
         }
         serializer.endDocument()
 
-        followRedirects {
-            httpClient.prepareRequest {
-                url(location)
+        followRedirects({
+            httpClient.prepareRequest(location) {
                 method = HttpMethod.parse("PROPFIND")
-                setBody(writer.toString())
-                header(HttpHeaders.ContentType, MIME_XML)
+
                 header(HttpHeaders.Depth, if (depth >= 0) depth.toString() else "infinity")
-            }.execute()
-        }.let { response ->
+
+                contentType(MIME_XML_UTF8)
+                setBody(writer.toString())
+            }
+        }) { response ->
             processMultiStatus(response, callback)
         }
     }
@@ -607,14 +533,14 @@ open class DavResource @JvmOverloads constructor(
     /**
      * Sends a PROPPATCH request to the server in order to set and remove properties.
      *
-     * @param setProperties     map of properties that shall be set (values currently have to be strings)
-     * @param removeProperties  list of names of properties that shall be removed
-     * @param callback  called for every XML response element in the Multi-Status response
-     *
      * Follows up to [MAX_REDIRECTS] redirects.
      *
      * Currently expects a 207 Multi-Status response although servers are allowed to
      * return other values, too.
+     *
+     * @param setProperties     map of properties that shall be set (values currently have to be strings)
+     * @param removeProperties  list of names of properties that shall be removed
+     * @param callback          called for every XML response element in the Multi-Status response
      *
      * @throws IOException on I/O error
      * @throws HttpException on HTTP error
@@ -627,15 +553,15 @@ open class DavResource @JvmOverloads constructor(
     ) {
         val rqBody = createProppatchXml(setProperties, removeProperties)
 
-        followRedirects {
-            httpClient.prepareRequest {
-                url(location)
+        followRedirects({
+            httpClient.prepareRequest(location) {
                 method = HttpMethod.parse("PROPPATCH")
+
+                contentType(MIME_XML_UTF8)
                 setBody(rqBody)
-                header(HttpHeaders.ContentType, MIME_XML)
-            }.execute()
-        }.let { response ->
-            // TODO handle not only 207 Multi-Status
+            }
+        }) { response ->
+            // room for further improvement: handle not only 207 Multi-Status
             // http://www.webdav.org/specs/rfc4918.html#PROPPATCH-status
 
             processMultiStatus(response, callback)
@@ -645,9 +571,11 @@ open class DavResource @JvmOverloads constructor(
     /**
      * Sends a SEARCH request (RFC 5323) with the given body to the server.
      *
-     * Follows up to [MAX_REDIRECTS] redirects. Expects a 207 Multi-Status response.
+     * Follows up to [MAX_REDIRECTS] redirects.
      *
-     * @param search    search request body (XML format, DAV:searchrequest or DAV:query-schema-discovery)
+     * Expects a 207 Multi-Status response.
+     *
+     * @param search    search request body (in XML format; like `DAV:searchrequest` or `DAV:query-schema-discovery`)
      * @param callback  called for every XML response element in the Multi-Status response
      *
      * @throws IOException on I/O error
@@ -655,14 +583,14 @@ open class DavResource @JvmOverloads constructor(
      * @throws DavException on WebDAV error (like no 207 Multi-Status response) or HTTPS -> HTTP redirect
      */
     suspend fun search(search: String, callback: MultiResponseCallback) {
-        followRedirects {
-            httpClient.prepareRequest {
-                url(location)
+        followRedirects({
+            httpClient.prepareRequest(location) {
                 method = HttpMethod.parse("SEARCH")
+
+                contentType(MIME_XML_UTF8)
                 setBody(search)
-                header(HttpHeaders.ContentType, MIME_XML)
-            }.execute()
-        }.let { response ->
+            }
+        }) { response ->
             processMultiStatus(response, callback)
         }
     }
@@ -670,117 +598,126 @@ open class DavResource @JvmOverloads constructor(
 
     // status handling
 
-
     /**
-     * Checks the status from an HTTP response and throws an exception in case of an error.
+     * Checks the status from an HTTP response and throws a specific exception in case of an error.
      *
      * @throws HttpException in case of an HTTP error
      */
-    protected fun checkStatus(response: HttpResponse) {
+    protected suspend fun checkStatus(response: HttpResponse) {
         if (response.status.isSuccess())
-        // everything OK
-            return
+            return      // everything OK
 
-        throw when (response.status.value) {
-            401 -> UnauthorizedException(response)
-            403 -> ForbiddenException(response)
-            404 -> NotFoundException(response)
-            409 -> ConflictException(response)
-            410 -> GoneException(response)
-            412 -> PreconditionFailedException(response)
-            503 -> ServiceUnavailableException(response)
-            else -> HttpException(response)
-        }
+        throw HttpException.fromResponse(response)
     }
 
     /**
      * Send a request and follows up to [MAX_REDIRECTS] redirects.
      *
-     * @param sendRequest called to send the request (may be called multiple times)
+     * @param prepareRequest    prepares the request (may be called multiple times with updated [location])
+     * @param callback          called for the final resource that is not redirected anymore
+     *                          (may never be called if there are too many redirects)
      *
-     * @return response of the last request (whether it is a redirect or not)
-     *
-     * @throws DavException on HTTPS -> HTTP redirect
+     * @throws DavException     on invalid redirects or when the number of redirects has reached [MAX_REDIRECTS]
      */
-    internal suspend fun followRedirects(sendRequest: suspend () -> HttpResponse): HttpResponse {
-
-        lateinit var response: HttpResponse
-        for (attempt in 1..MAX_REDIRECTS) {
-            response = sendRequest()
-            if (response.status in listOf(
-                    HttpStatusCode.PermanentRedirect,
-                    HttpStatusCode.TemporaryRedirect,
-                    HttpStatusCode.MultipleChoices,
+    internal suspend fun followRedirects(prepareRequest: suspend () -> HttpStatement, callback: ResponseCallback) {
+        var redirects = 0
+        var finished = false
+        while (!finished) {
+            prepareRequest().execute { response ->
+                val isRedirect = response.status in arrayOf(
                     HttpStatusCode.MovedPermanently,
                     HttpStatusCode.Found,
-                    HttpStatusCode.SeeOther)
-            )     //if is redirect
-            // handle 3xx Redirection
-                response.let {
-                    val target = it.headers[HttpHeaders.Location]?.let { newLocation ->
-                        URLBuilder(location).takeFrom(newLocation).build()
+                    HttpStatusCode.TemporaryRedirect,
+                    HttpStatusCode.PermanentRedirect
+                )
+                if (isRedirect) {
+                    if (++redirects >= MAX_REDIRECTS)
+                        throw DavException("Too many redirects")
+
+                    // take new location from response header
+                    val newLocation = response.headers[HttpHeaders.Location]
+                        ?: throw DavException("Redirected without new Location")
+
+                    // resolve possible relative location URL
+                    val destination = try {
+                        URLBuilder(location)
+                            .takeFrom(newLocation)
+                            .build()
+                    } catch (e: URLParserException) {
+                        throw DavException("Redirected to invalid Location", cause = e)
                     }
-                    if (target != null) {
-                        logger.info("Redirected, new location = $target")    // TODO: Is logger.info ok here?
 
-                        if (location.protocol.isSecure() && !target.protocol.isSecure())
-                            throw DavException("Received redirect from HTTPS to HTTP")
+                    // block insecure redirects
+                    if (location.protocol.isSecure() && !destination.protocol.isSecure())
+                        throw DavException("Received redirect from HTTPS to HTTP")
 
-                        location = target
-                    } else
-                        throw DavException("Redirected without new Location")
+                    // save new location
+                    location = destination
+
+                } else {
+                    // no redirect, pass scoped response to callback
+                    callback.onResponse(response)
+
+                    // quit loop (we can't use break because we're in the scoped execute() callback)
+                    finished = true
                 }
-            else
-                break
-        }
-        return response
-    }
-
-    /**
-     * Validates a 207 Multi-Status response.
-     *
-     * @param httpResponse will be checked for Multi-Status response
-     *
-     * @throws DavException if the response is not a Multi-Status response
-     */
-    suspend fun assertMultiStatus(httpResponse: HttpResponse) {
-        val response = httpResponse
-
-        if (response.status != HttpStatusCode.MultiStatus)
-            throw DavException("Expected 207 Multi-Status, got ${response.status.value} ${response.status.description}", response = response)
-
-        val bodyChannel = response.bodyAsChannel()
-
-        response.contentType()?.let { mimeType ->          // is response.contentType() ok here? Or must it be the content type of the body?
-            if (((!ContentType.Application.contains(mimeType) && !ContentType.Text.contains(mimeType))) || mimeType.contentSubtype != "xml") {
-                /* Content-Type is not application/xml or text/xml although that is expected here.
-                   Some broken servers return an XML response with some other MIME type. So we try to see
-                   whether the response is maybe XML although the Content-Type is something else. */
-                try {
-                    val firstBytes = ByteArray(XML_SIGNATURE.size)
-                    bodyChannel.readBuffer().peek().readFully(firstBytes)
-                    if (XML_SIGNATURE.contentEquals(firstBytes)) {
-                        logger.warn("Received 207 Multi-Status that seems to be XML but has MIME type $mimeType")
-
-                        // response is OK, return and do not throw Exception below
-                        return
-                    }
-                } catch (e: Exception) {
-                    logger.warn("Couldn't scan for XML signature", e)
-                }
-
-                throw DavException("Received non-XML 207 Multi-Status", response = response)
             }
-        } ?: logger.warn("Received 207 Multi-Status without Content-Type, assuming XML")
+        }
     }
 
 
     // Multi-Status handling
 
     /**
+     * Validates a 207 Multi-Status response.
+     *
+     * @param httpResponse  response that will be checked for Multi-Status
+     * @param bodyChannel   response body channel that will be peeked into in order to
+     *                      determine whether it's XML
+     *
+     * @throws DavException if the response is not a Multi-Status response with XML body
+     */
+    suspend fun assertMultiStatus(httpResponse: HttpResponse, bodyChannel: ByteReadChannel) {
+        if (httpResponse.status != HttpStatusCode.MultiStatus)
+            throw DavException.fromResponse(
+                message = "Expected 207 Multi-Status, got ${httpResponse.status}",
+                response = httpResponse,
+                responseBodyChannel = bodyChannel
+            )
+
+        val contentType = httpResponse.contentType()
+        if (contentType == null) {
+            logger.warn("Received 207 Multi-Status without Content-Type, assuming XML")
+            return  // supposed XML response body, fine
+        }
+
+        if (contentType.isXml())
+            return  // reported XML response body, fine
+
+        /* Content-Type is not application/xml or text/xml although that is expected here.
+           Some broken servers return an XML response with some other MIME type. So we try to see
+           whether the response is maybe XML although the Content-Type is something else. */
+        try {
+            val firstBytes = bodyChannel.peek(XML_SIGNATURE.size)
+            if (firstBytes == XML_SIGNATURE) {
+                logger.warn("Received 207 Multi-Status that seems to be XML but has MIME type $contentType")
+                return  // response body starts with XML signature, fine
+            }
+        } catch (e: Exception) {
+            logger.warn("Couldn't scan for XML signature", e)
+        }
+
+        // non-XML response body
+        throw DavException.fromResponse(
+            message = "Received non-XML 207 Multi-Status",
+            response = httpResponse
+        )
+    }
+
+    /**
      * Processes a Multi-Status response.
      *
-     * @param response response which is expected to contain a Multi-Status response
+     * @param response unconsumed response which is expected to contain a Multi-Status response
      * @param callback called for every XML response element in the Multi-Status response
      *
      * @return list of properties which have been received in the Multi-Status response, but
@@ -792,66 +729,35 @@ open class DavResource @JvmOverloads constructor(
      */
     protected suspend fun processMultiStatus(response: HttpResponse, callback: MultiResponseCallback): List<Property> {
         checkStatus(response)
-        assertMultiStatus(response)
-        return processMultiStatus(response.bodyAsBytes().inputStream().reader(), callback)
-    }
+        val bodyChannel = response.bodyAsChannel()
 
-    /**
-     * Processes a Multi-Status response.
-     *
-     * @param reader   the Multi-Status response is read from this
-     * @param callback called for every XML response element in the Multi-Status response
-     *
-     * @return list of properties which have been received in the Multi-Status response, but
-     * are not part of response XML elements (like `sync-token` which is returned as [SyncToken])
-     *
-     * @throws IOException on I/O error
-     * @throws HttpException on HTTP error
-     * @throws DavException on WebDAV error (like an invalid XML response)
-     */
-    protected fun processMultiStatus(reader: Reader, callback: MultiResponseCallback): List<Property> {
-        val responseProperties = mutableListOf<Property>()
+        // verify that the response is 207 Multi-Status
+        assertMultiStatus(response, bodyChannel)
+
         val parser = XmlUtils.newPullParser()
 
-        fun parseMultiStatus(): List<Property> {
-            // <!ELEMENT multistatus (response*, responsedescription?,
-            //                        sync-token?) >
-            val depth = parser.depth
-            var eventType = parser.eventType
-            while (!(eventType == XmlPullParser.END_TAG && parser.depth == depth)) {
-                if (eventType == XmlPullParser.START_TAG && parser.depth == depth + 1)
-                    when (parser.propertyName()) {
-                        RESPONSE ->
-                            Response.parse(parser, location, callback)
-                        SyncToken.NAME ->
-                            XmlReader(parser).readText()?.let {
-                                responseProperties += SyncToken(it)
-                            }
-                    }
-                eventType = parser.next()
-            }
-
-            return responseProperties
-        }
-
         try {
-            parser.setInput(reader)
+            bodyChannel.toInputStream().use { stream ->
+                parser.setInput(stream, null)
 
-            var eventType = parser.eventType
-            while (eventType != XmlPullParser.END_DOCUMENT) {
-                if (eventType == XmlPullParser.START_TAG && parser.depth == 1)
-                    if (parser.propertyName() == MULTISTATUS)
-                        return parseMultiStatus()
-                // ignore further <multistatus> elements
-                eventType = parser.next()
+                var eventType = parser.eventType
+                while (eventType != XmlPullParser.END_DOCUMENT) {
+                    if (eventType == XmlPullParser.START_TAG && parser.depth == 1)
+                        if (parser.propertyName() == WebDAV.MultiStatus) {
+                            return MultiStatusParser(location, callback).parseResponse(parser)
+                            // further <multistatus> elements are ignored
+                        }
+
+                    eventType = parser.next()
+                }
             }
 
             throw DavException("Multi-Status response didn't contain multistatus XML element")
 
         } catch (e: EOFException) {
-            throw DavException("Incomplete multistatus XML element", e)
+            throw DavException("Incomplete multistatus XML element", cause = e)
         } catch (e: XmlPullParserException) {
-            throw DavException("Couldn't parse multistatus XML element", e)
+            throw DavException("Couldn't parse multistatus XML element", cause = e)
         }
     }
 

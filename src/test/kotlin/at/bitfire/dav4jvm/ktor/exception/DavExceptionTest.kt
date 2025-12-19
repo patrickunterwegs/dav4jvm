@@ -21,7 +21,7 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.Url
 import io.ktor.http.headersOf
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -33,36 +33,28 @@ import java.io.ObjectOutputStream
 
 class DavExceptionTest {
 
-    val sampleUrl = Url("https://127.0.0.1/dav/")
-
+    private val sampleUrl = Url("https://127.0.0.1/dav/")
 
     @Test
-    fun fromResponse() {
-
-        val mockEngine = MockEngine { request ->
+    fun fromResponse() = runTest {
+        val mockEngine = MockEngine {
             respond(
                 status = HttpStatusCode.OK,
                 content = "Your Information",
                 headers = headersOf(HttpHeaders.ContentType, ContentType.Text.Plain.toString())
             )
         }
-        val httpClient = HttpClient(mockEngine) {
-            followRedirects = false
-        }
+        val httpClient = HttpClient(mockEngine)
+        val response = httpClient.get(sampleUrl)
         val cause = Exception()
+        val result = DavException.fromResponse("Unexpected response", response, cause = cause)
 
-
-        runBlocking {
-            val response = httpClient.get(sampleUrl)
-            val result = DavException("Message",  cause, response)
-
-            assertEquals("Message", result.message)
-            assertEquals(cause, result.cause)
-            assertEquals(200, result.statusCode)
-            assertEquals("GET $sampleUrl", result.requestExcerpt)
-            assertEquals("Your Information", result.responseExcerpt)
-            assertTrue(result.errors.isEmpty())
-        }
+        assertEquals("Unexpected response", result.message)
+        assertEquals(cause, result.cause)
+        assertEquals(200, result.statusCode)
+        assertEquals("GET $sampleUrl", result.requestExcerpt)
+        assertEquals("Your Information", result.responseExcerpt)
+        assertTrue(result.errors.isEmpty())
     }
 
     @Test
@@ -100,11 +92,4 @@ class DavExceptionTest {
         }
     }
 
-
-
-
 }
-
-
-
-

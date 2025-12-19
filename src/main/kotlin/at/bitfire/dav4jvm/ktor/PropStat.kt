@@ -12,12 +12,7 @@ package at.bitfire.dav4jvm.ktor
 
 import at.bitfire.dav4jvm.Error
 import at.bitfire.dav4jvm.Property
-import at.bitfire.dav4jvm.ktor.Response.Companion.STATUS
-import at.bitfire.dav4jvm.XmlUtils.propertyName
-import at.bitfire.dav4jvm.property.webdav.NS_WEBDAV
 import io.ktor.http.HttpStatusCode
-import org.xmlpull.v1.XmlPullParser
-import java.util.LinkedList
 
 /**
  * Represents a WebDAV propstat XML element.
@@ -28,33 +23,4 @@ data class PropStat(
     val properties: List<Property>,
     val status: HttpStatusCode,
     val error: List<Error>? = null
-) {
-
-    companion object {
-
-        @JvmField
-        val NAME = Property.Name(NS_WEBDAV, "propstat")
-
-        private val ASSUMING_OK = HttpStatusCode(200, "Assuming OK")
-
-        fun parse(parser: XmlPullParser): PropStat {
-            val depth = parser.depth
-
-            var status: HttpStatusCode? = null
-            val prop = LinkedList<Property>()
-
-            var eventType = parser.eventType
-            while (!(eventType == XmlPullParser.END_TAG && parser.depth == depth)) {
-                if (eventType == XmlPullParser.START_TAG && parser.depth == depth + 1)
-                    when (parser.propertyName()) {
-                        DavResource.Companion.PROP ->
-                            prop.addAll(Property.parse(parser))
-                        STATUS -> status = KtorHttpUtils.parseStatusLine(parser.nextText())                    }
-                eventType = parser.next()
-            }
-
-            return PropStat(prop, status ?: ASSUMING_OK)
-        }
-
-    }
-}
+)
